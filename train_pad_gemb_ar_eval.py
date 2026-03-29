@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from tqdm import tqdm
 import sys
 import pandas as pd
-sys.path.append("../")
+sys.path.append("../src/qaoa-gpt")
 
 from datetime import datetime
 import numpy as np
@@ -50,7 +50,7 @@ from util import generate_circ_from_df, eval_adapt_gpt_circ_jl
 
 
 
-n_epochs = 3 # (approximately)
+n_epochs = 1000 # (approximately)
 eval_ar_every = 1000
 
 # -----------------------------------------------------------------------------
@@ -64,14 +64,10 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True 
+wandb_project = 'qaoa-gpt-sat'
+wandb_run_name = 'baseline'
 # data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
 # model
 n_layer = 12
 n_head = 12
@@ -97,10 +93,29 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+# Configuration and Defaults
+dataset = 'n12_standard_mixer'
+out_dir = 'out'
+batch_size = 64
+gradient_accumulation_steps = 40
+block_size = 512
+eval_interval = 250
+eval_ar_every = 250
+eval_ar_locally = False
+pool_type = "qaoa_mixer"
 use_graph_emb = False
-pool_type = "qaoa_double_pool"
-exec(open('configurator.py').read()) # overrides from command line or config file
+graph_emb_dim = 500
+n_nodes = 12
+rounding_digits = 2
+mask_formula_loss = True
+# -----------------------------------------------------------------------------
+# configurator.py is in the same directory as this script
+script_dir = os.path.dirname(os.path.abspath(__file__))
+configurator_path = os.path.join(script_dir, 'configurator.py')
+exec(open(configurator_path).read()) # overrides from command line or config file
+
+# Collect ALL configuration keys after overrides for logging
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -157,10 +172,14 @@ train_data = np.load(
 val_data = np.load(
     os.path.join(data_dir, 'val.npy'), mmap_mode=mmap
 )
-graph_emb_np = np.load(
-    os.path.join(data_dir, 'feather_emb_d500.npy'), mmap_mode=mmap
-)
-emb_dim = graph_emb_np.shape[1]
+if use_graph_emb:
+    graph_emb_np = np.load(
+        os.path.join(data_dir, 'feather_emb_d500.npy'), mmap_mode=mmap
+    )
+    emb_dim = graph_emb_np.shape[1]
+else:
+    graph_emb_np = None
+    emb_dim = 0
 
 logging_json_file = os.path.join(out_dir, 'train_log.json')
 logging_list = []
@@ -169,25 +188,42 @@ def get_batch(split):
 
     if split == 'train':
         data = train_data
-        emb_idx_data = train_data_graph_idx_list
+        emb_idx_data = train_data_formula_idx_list
     else:
         data = val_data
-        emb_idx_data = val_data_graph_idx_list
+        emb_idx_data = val_data_formula_idx_list
     ix = np.random.randint(low=0, high=data.shape[0]-1, size=batch_size)
     data_batch_np = data[ix]
-    graph_emb_data = torch.tensor(graph_emb_np[emb_idx_data[ix]])
+    if use_graph_emb:
+        graph_emb_data = torch.from_numpy(graph_emb_np[emb_idx_data[ix]].astype(np.float32))
+    else:
+        graph_emb_data = None
 
     #print(f"Get batch graph_emb_data shape: {graph_emb_data.shape}, {graph_emb_data.dtype}")
-    x = torch.tensor(data_batch_np[:, :1, :].astype(np.int64)).flatten(1)
-    y = torch.tensor(data_batch_np[:, 1:2, :].astype(np.int64)).flatten(1)
+    x = torch.from_numpy(data_batch_np[:, :1, :].astype(np.int64)).flatten(1)
+    y = torch.from_numpy(data_batch_np[:, 1:2, :].astype(np.int64)).flatten(1)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-        graph_emb_data = graph_emb_data.pin_memory().to(device, non_blocking=True).to(torch.bfloat16)
+        if use_graph_emb:
+            graph_emb_data = graph_emb_data.pin_memory().to(device, non_blocking=True).to(torch.bfloat16)
     else:
         x, y = x.to(device), y.to(device)
-        graph_emb_data = graph_emb_data.to(device)
+        if use_graph_emb:
+            graph_emb_data = graph_emb_data.to(device)
     #print(f"graph_emb_data dtype: {graph_emb_data.dtype}\n\n\n")
+
+    if mask_formula_loss:
+        # Find index of end_of_formula token for each sequence in the batch
+        # stoi is available globally after meta is loaded
+        eof_token_id = meta['stoi']['end_of_formula']
+        for b in range(x.shape[0]):
+            eof_indices = (x[b] == eof_token_id).nonzero(as_tuple=True)[0]
+            if len(eof_indices) > 0:
+                eof_idx = eof_indices[0].item()
+                # Mask y from index 0 to eof_idx - 1 (the formula part)
+                # Setting to 0 relies on ignore_index=0 in the model's loss function
+                y[b, :eof_idx] = 0
 
     return x, y, graph_emb_data
 
@@ -206,7 +242,7 @@ def get_test_energies_df():
         val_sampled_df,
         model=model,
         graph_emb_np=val_graph_emb_np if use_graph_emb else None,
-        emb_graph_id_to_idx_dict=val_emb_graph_id_to_idx_dict if use_graph_emb else None,
+        emb_formula_id_to_idx_dict=val_emb_formula_id_to_idx_dict if use_graph_emb else None,
         meta=meta,
         device=device,
         ctx=ctx,
@@ -238,13 +274,17 @@ def eval_model_ar():
     print("Model evaluation...")
     test_energies_df = get_test_energies_df()
 
-    test_energies_expl_df = test_energies_df[['adapt_gpt_energies', 'energy_mqlib']].explode('adapt_gpt_energies')
+
+    # Determine ground truth column name
+    gt_col = 'ground_truth_energy' if 'ground_truth_energy' in test_energies_df.columns else 'energy_mqlib'
+    
+    test_energies_expl_df = test_energies_df[['adapt_gpt_energies', gt_col]].explode('adapt_gpt_energies')
     
     test_energies_expl_corr_df = test_energies_expl_df[
         test_energies_expl_df['adapt_gpt_energies'] != 999
     ]
     
-    test_energies_expl_corr_df['ar'] = test_energies_expl_corr_df['adapt_gpt_energies'] / test_energies_expl_corr_df['energy_mqlib']
+    test_energies_expl_corr_df['ar'] = test_energies_expl_corr_df['adapt_gpt_energies'] / test_energies_expl_corr_df[gt_col]
     
     avg_ar = round(test_energies_expl_corr_df['ar'].mean(), 5)
     
@@ -273,23 +313,48 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
-# For graph embeddings
-emb_graph_id_to_idx_dict = meta['emb_graph_id_to_idx_dict']
-emb_graph_idx_to_id_dict = meta['emb_graph_idx_to_id_dict']
-train_data_graph_idx_list = np.array(meta['train_data_graph_idx_list'])
-val_data_graph_idx_list = np.array(meta['val_data_graph_idx_list'])
+# For formula lcg graph embeddings
+emb_formula_id_to_idx_dict = meta.get('emb_formula_id_to_idx_dict')
+emb_formula_idx_to_id_dict = meta.get('emb_formula_idx_to_id_dict')
+train_data_formula_idx_list = np.array(meta.get('train_data_formula_idx_list'))
+val_data_formula_idx_list = np.array(meta.get('val_data_formula_idx_list'))
 
 
 # For AR validation
 ##########################################
-val_sampled_df = pd.read_pickle(os.path.join(data_dir, 'combined_res_tok_shf_val_df.pkl'))
+pkl_path = os.path.join(data_dir, 'combined_res_tok_shf_val_df.pkl')
+csv_path = os.path.join(data_dir, 'combined_res_tok_shf_val_df.csv')
+
+if os.path.exists(csv_path):
+    print(f"Loading validation data from CSV: {csv_path}")
+    val_sampled_df = pd.read_csv(csv_path)
+    # Ensure types are correct for CSV
+    if 'has_emb' in val_sampled_df.columns:
+        val_sampled_df['has_emb'] = val_sampled_df['has_emb'].map({'True': True, 'False': False, True: True, False: False})
+    if 'n_nodes' in val_sampled_df.columns:
+        val_sampled_df['n_nodes'] = pd.to_numeric(val_sampled_df['n_nodes'], errors='coerce')
+
+    # Convert strings to actual lists/dicts if loaded from CSV
+    import ast
+    for col in [f'token_seq_round_d{rounding_digits}', 'formula_list']:
+        if col in val_sampled_df.columns:
+            print(f"\tConverting {col} from string to list...")
+            val_sampled_df[col] = val_sampled_df[col].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+else:
+    print(f"Loading validation data from Pickle: {pkl_path}")
+    try:
+        val_sampled_df = pd.read_pickle(pkl_path)
+    except Exception as e:
+        print(f"Failed to load pickle: {e}")
+        raise e
+
 val_sampled_df = val_sampled_df[
     val_sampled_df['has_emb']
 ]
 val_n_nodes = int(val_sampled_df['n_nodes'].max())
 val_graph_emb_np = graph_emb_np
 val_meta = meta
-val_emb_graph_id_to_idx_dict = val_meta['emb_graph_id_to_idx_dict']
+val_emb_formula_id_to_idx_dict = val_meta.get('emb_formula_id_to_idx_dict')
 
 ##########################################
 
