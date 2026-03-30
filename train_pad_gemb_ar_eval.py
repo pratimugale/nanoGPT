@@ -22,13 +22,16 @@ import math
 import pickle
 from contextlib import nullcontext
 from tqdm import tqdm
-import sys
 import pandas as pd
-sys.path.append("../src/qaoa-gpt")
+import sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, "../src/qaoa-gpt"))
+
 
 from datetime import datetime
 import numpy as np
 import torch
+torch.set_float32_matmul_precision('high')
 import json
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -161,7 +164,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = globals().get('data_dir', os.path.join('data', dataset))
 
 mmap='r'
 mmap=None
@@ -242,7 +245,7 @@ def get_test_energies_df():
         val_sampled_df,
         model=model,
         graph_emb_np=val_graph_emb_np if use_graph_emb else None,
-        emb_formula_id_to_idx_dict=val_emb_formula_id_to_idx_dict if use_graph_emb else None,
+        emb_graph_id_to_idx_dict=val_emb_formula_id_to_idx_dict if use_graph_emb else None,
         meta=meta,
         device=device,
         ctx=ctx,
@@ -325,7 +328,10 @@ val_data_formula_idx_list = np.array(meta.get('val_data_formula_idx_list'))
 pkl_path = os.path.join(data_dir, 'combined_res_tok_shf_val_df.pkl')
 csv_path = os.path.join(data_dir, 'combined_res_tok_shf_val_df.csv')
 
-if os.path.exists(csv_path):
+if os.path.exists(pkl_path):
+    print(f"Loading validation data from Pickle: {pkl_path}")
+    val_sampled_df = pd.read_pickle(pkl_path)
+elif os.path.exists(csv_path):
     print(f"Loading validation data from CSV: {csv_path}")
     val_sampled_df = pd.read_csv(csv_path)
     # Ensure types are correct for CSV
@@ -341,12 +347,7 @@ if os.path.exists(csv_path):
             print(f"\tConverting {col} from string to list...")
             val_sampled_df[col] = val_sampled_df[col].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
 else:
-    print(f"Loading validation data from Pickle: {pkl_path}")
-    try:
-        val_sampled_df = pd.read_pickle(pkl_path)
-    except Exception as e:
-        print(f"Failed to load pickle: {e}")
-        raise e
+    raise FileNotFoundError(f"Could not find validation data at {pkl_path} or {csv_path}")
 
 val_sampled_df = val_sampled_df[
     val_sampled_df['has_emb']
