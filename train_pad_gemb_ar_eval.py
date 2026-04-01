@@ -53,7 +53,7 @@ from util import generate_circ_from_df, eval_adapt_gpt_circ_jl
 
 
 
-n_epochs = 1000 # (approximately)
+n_epochs = 20 # (approximately)
 eval_ar_every = 1000
 
 # -----------------------------------------------------------------------------
@@ -237,39 +237,118 @@ def get_batch(split):
 #-------------------------
 
 def get_test_energies_df():
-    
     model.eval()
+    print("Generating circuits with current state of the model (sequential)")
+    
+    all_samples_for_eval = []
+    
+    # Process sequentially for now
+    for sample_i, (idx, row) in enumerate(val_sampled_df.iterrows()):
+        formula_id = row['formula_id']
+        full_target_seq = row['token_seq_round_d2']
+        if isinstance(full_target_seq, str):
+            import ast
+            full_target_seq = ast.literal_eval(full_target_seq)
+            
+        eof_idx = full_target_seq.index('end_of_formula')
+        formula_tokens_raw = full_target_seq[:eof_idx + 1]
+        formula_tokens_ids = [meta['stoi'][t] for t in formula_tokens_raw]
+        
+        x_input = torch.tensor(formula_tokens_ids, dtype=torch.long, device=device).unsqueeze(0)
+        
+        if use_graph_emb:
+            formula_idx = val_emb_formula_id_to_idx_dict[formula_id]
+            cur_graph_emb = torch.from_numpy(val_graph_emb_np[formula_idx].astype(np.float32)).to(device).unsqueeze(0)
+            if device_type == 'cuda':
+                cur_graph_emb = cur_graph_emb.to(torch.bfloat16)
+        else:
+            cur_graph_emb = None
+            
+        q_circs = []
+        for c_i in range(5): # num_samples=5
+            with torch.no_grad():
+                with ctx:
+                    if use_graph_emb:
+                        y_out = model.generate(
+                            x_input, 
+                            cur_graph_emb, 
+                            max_new_tokens=150, 
+                            temperature=0.1, 
+                            top_k=200, 
+                            eos_id=meta['stoi']['eos']
+                        )
+                    else:
+                        y_out = model.generate(
+                            x_input,
+                            150,  # max_new_tokens is positional in model_pad.py GPT
+                            temperature=0.1,
+                            top_k=200,
+                            eos_id=meta['stoi']['eos']
+                        )
+            
+            generated_only = y_out[0].tolist()[len(formula_tokens_ids):]
+            circuit_tokens = [str(meta['itos'][t]) for t in generated_only if t != meta['stoi']['pad'] and t != meta['stoi']['eos']]
+            q_circs.append(circuit_tokens)
+            
+        gt_circuit_raw = full_target_seq[eof_idx + 1:]
+        
+        def clean_circ(tokens):
+            cleaned = []
+            for t in tokens:
+                t_str = str(t)
+                if t_str in ['bos', 'eos', 'pad', 'new_layer_p', 'end_of_formula']:
+                    if t_str == 'new_layer_p':
+                        cleaned.append(t_str)
+                    continue
+                if t_str.startswith('op_'):
+                    try:
+                        cleaned.append(int(t_str.split('_')[1]))
+                    except:
+                        cleaned.append(t_str)
+                else:
+                    try:
+                        cleaned.append(float(t_str))
+                    except:
+                        cleaned.append(t_str)
+            return cleaned
 
-    print("Generating circuits with current state of the model")
-    gc_df = generate_circ_from_df(
-        val_sampled_df,
-        model=model,
-        graph_emb_np=val_graph_emb_np if use_graph_emb else None,
-        emb_graph_id_to_idx_dict=val_emb_formula_id_to_idx_dict if use_graph_emb else None,
-        meta=meta,
-        device=device,
-        ctx=ctx,
-        n_samples_per_batch = 50, # max number of distinct graphs in a batch
-        num_samples = 5, # number of samples to draw
-        max_new_tokens = 150, # number of tokens generated in each sample
-        temperature = 0.1, # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-        top_k = 200, # retain only the top_k most likely tokens, clamp others to have 0 probability
-        token_seq_col = 'token_seq_round_d2',
-        normalize_weights_flag = False,
-    )
+        filename = str(row['filename'])
+        formula_type = 'balanced' if 'balanced' in filename.lower() else 'random'
+        formula_list_val = row['formula_list']
+        if isinstance(formula_list_val, str):
+            import ast
+            formula_list_val = ast.literal_eval(formula_list_val)
+
+        sample_for_eval = {
+            'graph_prefix': f"EVAL_ITER_{iter_num}__{sample_i}",
+            'type': formula_type,
+            'formula_jl': formula_list_val,
+            'energy_gurobi': float(row['ground_truth_energy']),
+            'adapt_circuit': clean_circ(gt_circuit_raw), 
+            'q_circuits': [clean_circ(c) for c in q_circs]
+        }
+        all_samples_for_eval.append(sample_for_eval)
 
     ## Evaluating energies with ADAPT.jl
-
     print("Evaluating energies with ADAPT.jl")
-    energies_jl_gc_df = eval_adapt_gpt_circ_jl(
-        gc_df,
-        adapt_gpt_path='../',
-        temp_folder = '../temp_data/',
-        n_nodes=val_n_nodes,
-        n_threads=4,
-        pool_type=pool_type,
-    )
-
+    root_dir = os.path.dirname(current_dir)
+    temp_dir = os.path.join(root_dir, 'temp_data')
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    in_file = os.path.join(temp_dir, 'val_eval_input_wandb.json')
+    out_file = os.path.join(temp_dir, 'val_eval_output_wandb.json')
+    
+    import json
+    with open(in_file, 'w') as f:
+        json.dump(all_samples_for_eval, f, indent=4)
+        
+    julia_script = 'src/qaoa-gpt/adapt_gpt_eval_energy.jl'
+    cmd = f"julia -t 4 --project=ADAPT.jl {julia_script} {in_file} {out_file} {val_n_nodes} {pool_type}"
+    
+    import subprocess
+    subprocess.run(cmd, shell=True, check=True)
+    
+    energies_jl_gc_df = pd.read_json(out_file)
     return energies_jl_gc_df
 
 def eval_model_ar():
@@ -278,26 +357,30 @@ def eval_model_ar():
     test_energies_df = get_test_energies_df()
 
 
-    # Determine ground truth column name
-    gt_col = 'ground_truth_energy' if 'ground_truth_energy' in test_energies_df.columns else 'energy_mqlib'
+    sum_valid_best = 0
+    sum_valid_avg = 0.0
+    sum_ar_best = 0.0
+    sum_ar_avg = 0.0
     
-    test_energies_expl_df = test_energies_df[['adapt_gpt_energies', gt_col]].explode('adapt_gpt_energies')
+    for idx, row in test_energies_df.iterrows():
+        res = row['result_quality']
+        sample_svr = res.get('sample_svr', 0.0)
+        
+        sum_valid_avg += sample_svr
+        if sample_svr > 0:
+            sum_valid_best += 1
+            sum_ar_best += res.get('best_ar_qaoa_gpt', 0.0)
+            sum_ar_avg += res.get('avg_ar_qaoa_gpt', 0.0)
+            
+    total = len(test_energies_df)
     
-    test_energies_expl_corr_df = test_energies_expl_df[
-        test_energies_expl_df['adapt_gpt_energies'] != 999
-    ]
+    best_valid_rate = sum_valid_best / total if total > 0 else 0.0
+    avg_valid_rate = sum_valid_avg / total if total > 0 else 0.0
     
-    test_energies_expl_corr_df['ar'] = test_energies_expl_corr_df['adapt_gpt_energies'] / test_energies_expl_corr_df[gt_col]
-    
-    avg_ar = round(test_energies_expl_corr_df['ar'].mean(), 5)
-    
-    test_energies_expl_inc_df = test_energies_expl_df[
-        test_energies_expl_df['adapt_gpt_energies'] == 999
-    ]
-    
-    wrong_circ_rate = round(len(test_energies_expl_inc_df) / len(test_energies_expl_df), 5)
+    best_ar = sum_ar_best / sum_valid_best if sum_valid_best > 0 else 0.0
+    avg_ar = sum_ar_avg / sum_valid_best if sum_valid_best > 0 else 0.0
 
-    return test_energies_df, avg_ar, wrong_circ_rate
+    return test_energies_df, best_ar, avg_ar, 1.0 - best_valid_rate, 1.0 - avg_valid_rate
 
 #-------------------------
 #-------------------------
@@ -352,6 +435,12 @@ else:
 val_sampled_df = val_sampled_df[
     val_sampled_df['has_emb']
 ]
+
+_eval_ar_n_samples = globals().get('eval_ar_n_samples', 50)
+if len(val_sampled_df) > _eval_ar_n_samples:
+    print(f"Subsampling validation set from {len(val_sampled_df)} down to {_eval_ar_n_samples} formulas for efficient AR evaluation.")
+    val_sampled_df = val_sampled_df.sample(n=_eval_ar_n_samples, random_state=42)
+
 val_n_nodes = int(val_sampled_df['n_nodes'].max())
 val_graph_emb_np = graph_emb_np
 val_meta = meta
@@ -473,6 +562,11 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    
+    # Define 'iter' as the default x-axis for train and val metrics
+    wandb.define_metric("iter")
+    wandb.define_metric("train/*", step_metric="iter")
+    wandb.define_metric("val/*", step_metric="iter")
 
 # training loop
 X, Y, cur_graph_emb = get_batch('train') # fetch the very first batch
@@ -483,6 +577,11 @@ raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 #while True:
 
+
+cur_best_ar = None
+cur_avg_ar = None
+cur_best_er = None
+cur_avg_er = None
 
 dataset_n_batches = train_data.shape[0]//batch_size
 pbar = tqdm(list(range(n_epochs * dataset_n_batches)))
@@ -500,10 +599,15 @@ for i in pbar:
         saving_model_name = f'ckpt_{i}_{model_suf}.pt'
         if iter_num % eval_ar_every == 0 and iter_num > 0:
             print("\tEvaluating model ER and AR...")
-            cur_test_energies_df, cur_ar, cur_er = eval_model_ar()
-            print(f"\tCurrent ar: {cur_ar}, error rate: {cur_er}\n\n")
-            cur_ar_str = str(cur_ar).replace('.', '_')
-            cur_er_str = str(cur_er).replace('.', '_')
+            
+            # Temporarily disable Dropout for generation
+            model.eval()
+            cur_test_energies_df, cur_best_ar, cur_avg_ar, cur_best_er, cur_avg_er = eval_model_ar()
+            model.train()
+            
+            print(f"\tCurrent avg_ar: {cur_avg_ar}, avg_er: {cur_avg_er}\n\n")
+            cur_ar_str = str(cur_avg_ar).replace('.', '_')
+            cur_er_str = str(cur_avg_er).replace('.', '_')
             saving_model_name = f'ckpt_{i}_{model_suf}__ar_{cur_ar_str}__er_{cur_er_str}.pt'
 
             logging_list.append(
@@ -513,8 +617,10 @@ for i in pbar:
                     'iter_num': iter_num,
                     'cur_gpt_loss_train': losses['train'].item(),
                     'cur_gpt_loss_val': losses['val'].item(),
-                    'cur_ar_val': cur_ar,
-                    'cur_er_val': cur_er,
+                    'cur_best_ar_val': cur_best_ar,
+                    'cur_avg_ar_val': cur_avg_ar,
+                    'cur_best_er_val': cur_best_er,
+                    'cur_avg_er_val': cur_avg_er,
                     'cur_val_df': cur_test_energies_df.to_json(),
                 }
             )
@@ -525,13 +631,23 @@ for i in pbar:
         #print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         pbar.set_description(f"train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if cur_best_ar is not None:
+                log_dict["val/best_ar"] = cur_best_ar
+                log_dict["val/avg_ar"] = cur_avg_ar
+                
+                log_dict["val/best_error_rate"] = cur_best_er
+                log_dict["val/avg_error_rate"] = cur_avg_er
+                
+                log_dict["val/best_svr"] = 1.0 - cur_best_er
+                log_dict["val/avg_svr"] = 1.0 - cur_avg_er
+            wandb.log(log_dict)
         #if losses['val'] < best_val_loss or always_save_checkpoint:
         if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
