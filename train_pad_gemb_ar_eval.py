@@ -238,112 +238,143 @@ def get_batch(split):
 
 def get_test_energies_df():
     model.eval()
-    print("Generating circuits with current state of the model (sequential)")
+    print(f"Generating circuits for {len(val_sampled_df)} formulas (5 samples each) in vectorized batches...")
     
-    all_samples_for_eval = []
-    
-    # Process sequentially for now
-    for sample_i, (idx, row) in enumerate(val_sampled_df.iterrows()):
-        formula_id = row['formula_id']
+    def clean_circ(tokens):
+        cleaned = []
+        for t in tokens:
+            t_str = str(t)
+            if t_str in ['bos', 'eos', 'pad', 'new_layer_p', 'end_of_formula']:
+                if t_str == 'new_layer_p':
+                    cleaned.append(t_str)
+                continue
+            if t_str.startswith('op_'):
+                try:
+                    cleaned.append(int(t_str.split('_')[1]))
+                except:
+                    cleaned.append(t_str)
+            else:
+                try:
+                    cleaned.append(float(t_str))
+                except:
+                    cleaned.append(t_str)
+        return cleaned
+
+    # First pass: Group instances by formula length
+    len_buckets = {}
+    for i, (idx, row) in enumerate(val_sampled_df.iterrows()):
         full_target_seq = row['token_seq_round_d2']
         if isinstance(full_target_seq, str):
             import ast
             full_target_seq = ast.literal_eval(full_target_seq)
             
         eof_idx = full_target_seq.index('end_of_formula')
-        formula_tokens_raw = full_target_seq[:eof_idx + 1]
-        formula_tokens_ids = [meta['stoi'][t] for t in formula_tokens_raw]
+        formula_tokens_ids = [meta['stoi'][t] for t in full_target_seq[:eof_idx + 1]]
         
-        x_input = torch.tensor(formula_tokens_ids, dtype=torch.long, device=device).unsqueeze(0)
+        L = len(formula_tokens_ids)
+        if L not in len_buckets:
+            len_buckets[L] = []
+        len_buckets[L].append((row, formula_tokens_ids, i))
+
+    all_samples_for_eval = []
+    eos_id = meta['stoi']['eos']
+    pad_id = meta['stoi']['pad']
+    num_samples = 5 # hardcoded for validation
+
+    # Second pass: Process buckets in parallel
+    for L, bucket in len_buckets.items():
+        B = len(bucket)
         
+        formula_batch = [item[1] for item in bucket]
+        x_input = torch.tensor(formula_batch, dtype=torch.long, device=device)
+        # Expand for num_samples
+        x_input = x_input.repeat_interleave(num_samples, dim=0)
+
         if use_graph_emb:
-            formula_idx = val_emb_formula_id_to_idx_dict[formula_id]
-            cur_graph_emb = torch.from_numpy(val_graph_emb_np[formula_idx].astype(np.float32)).to(device).unsqueeze(0)
+            emb_batch = []
+            for item in bucket:
+                row = item[0]
+                formula_id = row['formula_id']
+                emb_idx = val_emb_formula_id_to_idx_dict[formula_id]
+                emb_batch.append(val_graph_emb_np[emb_idx])
+            
+            cur_graph_emb = torch.tensor(np.array(emb_batch), dtype=torch.float32, device=device)
+            cur_graph_emb = cur_graph_emb.repeat_interleave(num_samples, dim=0)
             if device_type == 'cuda':
                 cur_graph_emb = cur_graph_emb.to(torch.bfloat16)
         else:
             cur_graph_emb = None
-            
-        q_circs = []
-        for c_i in range(5): # num_samples=5
-            with torch.no_grad():
-                with ctx:
-                    if use_graph_emb:
-                        y_out = model.generate(
-                            x_input, 
-                            cur_graph_emb, 
-                            max_new_tokens=150, 
-                            temperature=0.1, 
-                            top_k=200, 
-                            eos_id=meta['stoi']['eos']
-                        )
-                    else:
-                        y_out = model.generate(
-                            x_input,
-                            150,  # max_new_tokens is positional in model_pad.py GPT
-                            temperature=0.1,
-                            top_k=200,
-                            eos_id=meta['stoi']['eos']
-                        )
-            
-            generated_only = y_out[0].tolist()[len(formula_tokens_ids):]
-            circuit_tokens = [str(meta['itos'][t]) for t in generated_only if t != meta['stoi']['pad'] and t != meta['stoi']['eos']]
-            q_circs.append(circuit_tokens)
-            
-        gt_circuit_raw = full_target_seq[eof_idx + 1:]
-        
-        def clean_circ(tokens):
-            cleaned = []
-            for t in tokens:
-                t_str = str(t)
-                if t_str in ['bos', 'eos', 'pad', 'new_layer_p', 'end_of_formula']:
-                    if t_str == 'new_layer_p':
-                        cleaned.append(t_str)
-                    continue
-                if t_str.startswith('op_'):
-                    try:
-                        cleaned.append(int(t_str.split('_')[1]))
-                    except:
-                        cleaned.append(t_str)
+
+        max_gen = block_size - L
+
+        with torch.no_grad():
+            with ctx:
+                if use_graph_emb:
+                    y_out = model.generate(
+                        x_input, cur_graph_emb,
+                        max_new_tokens=max_gen, temperature=0.1, top_k=200,
+                        eos_id=eos_id
+                    )
                 else:
-                    try:
-                        cleaned.append(float(t_str))
-                    except:
-                        cleaned.append(t_str)
-            return cleaned
+                    y_out = model.generate(
+                        x_input, max_gen,
+                        temperature=0.1, top_k=200,
+                        eos_id=eos_id
+                    )
 
-        filename = str(row['filename'])
-        formula_type = 'balanced' if 'balanced' in filename.lower() else 'random'
-        formula_list_val = row['formula_list']
-        if isinstance(formula_list_val, str):
-            import ast
-            formula_list_val = ast.literal_eval(formula_list_val)
+        # Post-process the batch
+        for b_i in range(B):
+            row, _, original_i = bucket[b_i]
+            formula_id = row['formula_id']
+            full_target_seq = row['token_seq_round_d2']
+            if isinstance(full_target_seq, str):
+                full_target_seq = ast.literal_eval(full_target_seq)
+            eof_idx = full_target_seq.index('end_of_formula')
+            gt_circuit_raw = full_target_seq[eof_idx + 1:]
 
-        sample_for_eval = {
-            'graph_prefix': f"EVAL_ITER_{iter_num}__{sample_i}",
-            'type': formula_type,
-            'formula_jl': formula_list_val,
-            'energy_gurobi': float(row['ground_truth_energy']),
-            'adapt_circuit': clean_circ(gt_circuit_raw), 
-            'q_circuits': [clean_circ(c) for c in q_circs]
-        }
-        all_samples_for_eval.append(sample_for_eval)
+            q_circs = []
+            for s_i in range(num_samples):
+                seq_idx = b_i * num_samples + s_i
+                generated_token_ids = y_out[seq_idx].tolist()[L:]
+                try:
+                    eos_index = generated_token_ids.index(eos_id)
+                    actual_gen_ids = generated_token_ids[:eos_index]
+                except ValueError:
+                    actual_gen_ids = generated_token_ids
+                
+                circuit_tokens = [str(meta['itos'][tid]) for tid in actual_gen_ids if tid != pad_id and tid != eos_id]
+                q_circs.append(clean_circ(circuit_tokens))
+
+            filename = str(row['filename'])
+            formula_type = 'balanced' if 'balanced' in filename.lower() else 'random'
+            formula_list_val = row['formula_list']
+            if isinstance(formula_list_val, str):
+                formula_list_val = ast.literal_eval(formula_list_val)
+
+            all_samples_for_eval.append({
+                'graph_prefix': f"EVAL_ITER_{iter_num}__{original_i}",
+                'type': formula_type,
+                'formula_jl': formula_list_val,
+                'energy_gurobi': float(row['ground_truth_energy']),
+                'adapt_circuit': clean_circ(gt_circuit_raw), 
+                'q_circuits': q_circs
+            })
 
     ## Evaluating energies with ADAPT.jl
-    print("Evaluating energies with ADAPT.jl")
+    print(f"Evaluating {len(all_samples_for_eval)} samples with ADAPT.jl")
     root_dir = os.path.dirname(current_dir)
     temp_dir = os.path.join(root_dir, 'temp_data')
     os.makedirs(temp_dir, exist_ok=True)
     
-    in_file = os.path.join(temp_dir, 'val_eval_input_wandb.json')
+    in_file  = os.path.join(temp_dir, 'val_eval_input_wandb.json')
     out_file = os.path.join(temp_dir, 'val_eval_output_wandb.json')
     
-    import json
     with open(in_file, 'w') as f:
         json.dump(all_samples_for_eval, f, indent=4)
         
     julia_script = 'src/qaoa-gpt/adapt_gpt_eval_energy.jl'
-    cmd = f"julia -t 4 --project=ADAPT.jl {julia_script} {in_file} {out_file} {val_n_nodes} {pool_type}"
+    # Fixed val_n_nodes to n_nodes (which is global)
+    cmd = f"julia -t 4 --project=ADAPT.jl {julia_script} {in_file} {out_file} {n_nodes} {pool_type}"
     
     import subprocess
     subprocess.run(cmd, shell=True, check=True)

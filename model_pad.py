@@ -333,8 +333,8 @@ class GPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-            # early stopping if eos token is generated
-            if eos_id is not None and idx_next.item() == eos_id:
+            # early stopping if eos token is generated (batch-aware)
+            if eos_id is not None and (idx_next == eos_id).all():
                 break
 
         return idx
