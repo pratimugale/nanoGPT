@@ -42,7 +42,7 @@ from nanoGPT.model_pad_gemb import GPT as GPT_gemb
 from nanoGPT.model_pad import GPTConfig as GPTConfig_nogemb
 from nanoGPT.model_pad import GPT as GPT_nogemb
 
-from util import generate_circ_from_df, eval_adapt_gpt_circ_jl
+from nanoGPT.utils import clean_circ
 
 # val_sampled_df = pd.read_pickle('data/qaoa_n10w_012325_v7/test_run_df.pkl')
 # val_graph_emb_np = np.load(
@@ -239,26 +239,6 @@ def get_batch(split):
 def get_test_energies_df():
     model.eval()
     print(f"Generating circuits for {len(val_sampled_df)} formulas (5 samples each) in vectorized batches...")
-    
-    def clean_circ(tokens):
-        cleaned = []
-        for t in tokens:
-            t_str = str(t)
-            if t_str in ['bos', 'eos', 'pad', 'new_layer_p', 'end_of_formula']:
-                if t_str == 'new_layer_p':
-                    cleaned.append(t_str)
-                continue
-            if t_str.startswith('op_'):
-                try:
-                    cleaned.append(int(t_str.split('_')[1]))
-                except:
-                    cleaned.append(t_str)
-            else:
-                try:
-                    cleaned.append(float(t_str))
-                except:
-                    cleaned.append(t_str)
-        return cleaned
 
     # First pass: Group instances by formula length
     len_buckets = {}
@@ -490,6 +470,7 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    print(f"The vocabulary size is {model_args['vocab_size']}")
     if use_graph_emb:
         gptconf = GPTConfig_gemb(**model_args)
         model = GPT_gemb(gptconf)
