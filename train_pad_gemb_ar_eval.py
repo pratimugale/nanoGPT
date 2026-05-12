@@ -26,6 +26,7 @@ import pandas as pd
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(current_dir, "../src/qaoa-gpt"))
+sys.path.append(os.path.join(current_dir, ".."))
 
 
 from datetime import datetime
@@ -44,21 +45,11 @@ from nanoGPT.model_pad import GPT as GPT_nogemb
 
 from nanoGPT.utils import clean_circ
 
-# val_sampled_df = pd.read_pickle('data/qaoa_n10w_012325_v7/test_run_df.pkl')
-# val_graph_emb_np = np.load(
-#     'data/qaoa_n10w_012325_v7/feather_emb_d500.npy'
-# )
-# val_meta = pd.read_pickle("data/qaoa_n10w_012325_v7/meta.pkl")
-# val_emb_graph_id_to_idx_dict = val_meta['emb_graph_id_to_idx_dict']
-
-
-
 n_epochs = 20 # (approximately)
 eval_ar_every = 1000
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
+# Note that a lot of the configuration is overridden from train_adapt_gpt_config.py
 out_dir = 'out'
 eval_interval = 20_000
 log_interval = 1
@@ -96,7 +87,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-# Configuration and Defaults
+# Configuration and Defaults - likely overriden by the config file 
 dataset = 'n12_standard_mixer'
 out_dir = 'out'
 batch_size = 64
@@ -259,7 +250,7 @@ def get_test_energies_df():
     all_samples_for_eval = []
     eos_id = meta['stoi']['eos']
     pad_id = meta['stoi']['pad']
-    num_samples = 5 # hardcoded for validation
+    num_samples = 5 
 
     # Second pass: Process buckets in parallel
     for L, bucket in len_buckets.items():
